@@ -111,7 +111,7 @@ jobs:
           fi
 
       - name: Download Git for Windows SDK
-        uses: git-for-windows/setup-git-for-windows-sdk@v1
+        uses: git-for-windows/setup-git-for-windows-sdk@6697295a149f95f97cb98aff3c2316cf264f7b80
         with:
           flavor: ${{ env.PACKAGE_TO_BUILD == 'mingw-w64-git' && 'build-installers' || 'full' }}
           architecture: ${{ env.ARCHITECTURE || 'aarch64' }}
@@ -185,17 +185,33 @@ jobs:
           dir="$(cygpath -au artifacts)" &&
           mkdir -p "$dir" &&
 
+          case "$ARCHITECTURE" in
+            aarch64)
+              GIT_EXE="/clangarm64/bin/git.exe"
+              MINGW_ARCHS_TO_BUILD="clangarm64"
+              BUILD_SRC=
+              ;;
+            *)
+              GIT_EXE="/mingw64/bin/git.exe"
+              MINGW_ARCHS_TO_BUILD="mingw32 mingw64"
+              BUILD_SRC="YesPlease"
+              ;;
+          esac &&
+
           {
             test -f /usr/bin/git ||
-            printf '#!/bin/sh\n\nexec /mingw64/bin/git.exe "$@"\n' >/usr/bin/git
+            printf '#!/bin/sh\n\nexec '$GIT_EXE' "$@"\n' >/usr/bin/git
           } &&
 
           cd "/usr/src/$REPO/$PACKAGE_TO_BUILD" &&
           MAKEFLAGS=-j6 PKGEXT='.pkg.tar.xz' MINGW_ARCH="clangarm64 mingw32 mingw64" $MAKEPKG -s --noconfirm &&
           cp *.pkg.tar* "$dir/" &&
-
-          MAKEFLAGS=-j6 SRCEXT='.src.tar.gz' MINGW_ARCH=mingw64 $MAKEPKG --allsource &&
-          cp *.src.tar* "$dir/" &&
+          
+          if test -n "$BUILD_SRC"
+          then
+            MAKEFLAGS=-j6 SRCEXT='.src.tar.gz' MINGW_ARCH=mingw64 $MAKEPKG --allsource &&
+            cp *.src.tar* "$dir/"
+          fi &&
 
           # Ensure that the Git worktree is still clean
           ls -la &&
