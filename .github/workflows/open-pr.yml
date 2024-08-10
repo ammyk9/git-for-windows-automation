@@ -1,26 +1,14 @@
 name: Upgrade a package version and open a PR
-run-name: Upgrade ${{ inputs.package }} to ${{ inputs.version }}
+run-name: DEBUG
 
 on:
-  workflow_dispatch:
-    inputs:
-      package:
-        description: The package to update
-        type: string
-        required: true
-      version:
-        description: The new version of the package
-        type: string
-        required: true
-      actor:
-        description: The GitHub user on whose behalf this workflow is run
-        required: false
+  push:
 
 env:
-  PACKAGE_TO_UPGRADE: ${{ github.event.inputs.package }}
-  UPGRADE_TO_VERSION: ${{ github.event.inputs.version }}
+  PACKAGE_TO_UPGRADE: mingw-w64-curl
+  UPGRADE_TO_VERSION: 7.88.1
   OWNER: 'git-for-windows'
-  ACTOR: "${{ github.event.inputs.actor || github.triggering_actor }}"
+  ACTOR: rimrul
 
 jobs:
   open-pr:
@@ -35,16 +23,11 @@ jobs:
           mingw-w64-git-lfs|mingw-w64-git-sizer|mingw-w64-wintoast|\
           git-extra|git-for-windows-keyring) repo=build-extra;;
           mingw-w64-*) repo=MINGW-packages;;
-          innosetup)
-            repo=build-extra &&
-            echo "package_path=installer" >>$GITHUB_ENV &&
-            echo "skip-deployment-check=true" >>$GITHUB_OUTPUT
-            ;;
           *) repo=MSYS2-packages;;
           esac &&
           echo "REPO=$repo" >>$GITHUB_ENV &&
           echo "repo=$repo" >>$GITHUB_OUTPUT
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
         # Since we want to operate on _another_ repository, we sadly cannot use:
         #
         # permissions:
@@ -54,7 +37,7 @@ jobs:
         # act as that App in repository secrets `GH_APP_ID`, `GH_APP_PRIVATE_KEY`.
       - name: Obtain installation token
         id: setup
-        uses: actions/github-script@v7
+        uses: actions/github-script@v6
         with:
           script: |
             const appId = ${{ secrets.GH_APP_ID }}
@@ -79,8 +62,69 @@ jobs:
 
             core.setSecret(accessToken)
             core.setOutput('token', accessToken)
-      - name: Initialize Git for Windows SDK subset
-        uses: ./.github/actions/init-g4w-sdk-for-pacman
+      - name: initialize bare SDK clone
+        id: clone-g4w-sdk
+        shell: bash
+        run: |
+          git clone --bare --depth=1 --single-branch --branch=main --filter=blob:none \
+            https://github.com/git-for-windows/git-sdk-64 .tmp &&
+          echo "rev=$(git -C .tmp rev-parse HEAD)+base64" >>$GITHUB_OUTPUT
+      - name: restore cached git-sdk-64 subset
+        id: restore-g4w-sdk
+        uses: actions/cache/restore@v3
+        env:
+          cache-name: cache-g4w-sdk
+        with:
+          path: .sdk
+          key: g4w-sdk-${{ steps.clone-g4w-sdk.outputs.rev }}
+      - name: check out git-sdk-64 subset
+        if: ${{ steps.restore-g4w-sdk.outputs.cache-hit != 'true' }}
+        shell: bash
+        env:
+          GIT_CONFIG_PARAMETERS: "'checkout.workers=56'"
+        run: |
+          git -C .tmp config extensions.worktreeConfig true &&
+          git -C .tmp worktree add --no-checkout --detach "$PWD/.sdk" &&
+          cd .sdk &&
+          git config --worktree core.sparseCheckout true &&
+          git config --worktree core.bare false &&
+          sparse="$(git rev-parse --git-path info/sparse-checkout)" &&
+          mkdir -p "${sparse%/*}" &&
+          git show HEAD:.sparse/minimal-sdk >"$sparse" &&
+          cat >>"$sparse" <<-EOF &&
+          /etc/makepkg.conf
+          /usr/bin/base64.exe
+          /usr/bin/gettext.exe
+          /usr/bin/makepkg
+          /usr/bin/nproc.exe
+          /usr/bin/pacman.exe
+          /usr/bin/sha256sum.exe
+          /usr/bin/updpkgsums
+          /usr/share/makepkg/
+          /mingw64/bin/curl.exe
+          EOF
+          git checkout -- &&
+
+          # makepkg/updpkgsums expects `curl` to be present in `/usr/bin/`
+          printf '#!/bin/sh\n\nexec /mingw64/bin/curl.exe "$@"' >usr/bin/curl
+      - name: cache git-sdk-64 subset
+        if: ${{ steps.restore-g4w-sdk.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v3
+        env:
+          cache-name: cache-g4w-sdk
+        with:
+          path: .sdk
+          key: g4w-sdk-${{ steps.clone-g4w-sdk.outputs.rev }}
+      - name: use git-sdk-64 subset
+        shell: bash
+        run: |
+          cd .sdk &&
+
+          # add the SDK directories to the `PATH`
+          cygpath -aw "usr/bin/core_perl" >>$GITHUB_PATH &&
+          cygpath -aw "usr/bin" >>$GITHUB_PATH &&
+          cygpath -aw "mingw64/bin" >>$GITHUB_PATH &&
+          echo "MSYSTEM=MINGW64" >>$GITHUB_ENV
       - name: Clone ${{ env.REPO }}
         shell: bash
         run: |
@@ -88,7 +132,7 @@ jobs:
           git clone --depth 1 --single-branch -b main "https://github.com/$OWNER/$REPO" "/usr/src/$REPO"
       - name: Identify actor
         id: actor
-        uses: actions/github-script@v7
+        uses: actions/github-script@v6
         with:
           script: |
             const githubApiRequest = require('./github-api-request')
@@ -114,7 +158,7 @@ jobs:
         id: update
         shell: bash
         run: |
-          cd "/usr/src/$REPO/${package_path-$PACKAGE_TO_UPGRADE}" &&
+          cd "/usr/src/$REPO/$PACKAGE_TO_UPGRADE" &&
           update_script="$GITHUB_WORKSPACE/update-scripts/version/$PACKAGE_TO_UPGRADE"
           if test -f "$update_script"
           then
@@ -126,7 +170,7 @@ jobs:
               PKGBUILD
           fi &&
           git update-index -q --refresh &&
-          if git diff-files --exit-code && git diff-index --quiet HEAD --
+          if git diff-files --exit-code
           then
             echo "::notice::$PACKAGE_TO_UPGRADE already at $UPGRADE_TO_VERSION"
             exit 0
@@ -140,26 +184,64 @@ jobs:
             updpkgsums
           fi &&
           msg="$PACKAGE_TO_UPGRADE: update to $UPGRADE_TO_VERSION" &&
-          { test ! -f PKGBUILD || git add PKGBUILD; } &&
-          git commit -sm "$msg" &&
+          git commit -sm "$msg" PKGBUILD &&
           echo "msg=$msg" >>$GITHUB_OUTPUT &&
           echo "modified=true" >>$GITHUB_OUTPUT
-      - name: check if the package was already deployed
-        if: steps.repo.outputs.skip-deployment-check != 'true'
-        shell: bash
-        run: |
-          ./update-scripts/ensure-not-yet-deployed.sh "/usr/src/$REPO/$PACKAGE_TO_UPGRADE"
       - name: push
         if: steps.update.outputs.modified == 'true'
         shell: bash
         run: |
           auth="$(printf '%s:%s' '${{ steps.actor.outputs.login }}' '${{ steps.setup.outputs.token }}' | base64)" &&
           echo "::add-mask::$auth" &&
-          cd "/usr/src/$REPO/${package_path-$PACKAGE_TO_UPGRADE}" &&
+          cd "/usr/src/$REPO/$PACKAGE_TO_UPGRADE" &&
           git -c http.extraHeader="Authorization: Basic $auth" push --force origin HEAD:refs/heads/$PACKAGE_TO_UPGRADE-$UPGRADE_TO_VERSION
+      - name: debug using tmate
+        if: failure()
+        shell: bash
+        env:
+          ACTOR_LOGIN: '${{ steps.actor.outputs.login }}'
+          ACTOR_TOKEN: '${{ steps.setup.outputs.token }}'
+        run: |
+          (
+            cd / &&
+            G4W=/c/Program\ Files/Git &&
+            cp -n "$G4W"/usr/bin/{ssh-keygen.exe,msys-crypto-1.1.dll,msys-z.dll} usr/bin/ &&
+
+            CURL="$G4W"/mingw64/bin/curl.exe &&
+            "$CURL" -Lo /tmp/tmate.tar.zst https://repo.msys2.org/msys/x86_64/tmate-2.4.0-1-x86_64.pkg.tar.zst &&
+            tar xvf /tmp/tmate.tar.zst usr/bin/tmate.exe &&
+            "$CURL" -Lo /tmp/libevent.tar.zst https://repo.msys2.org/msys/x86_64/libevent-2.1.12-2-x86_64.pkg.tar.zst &&
+            tar xvf /tmp/libevent.tar.zst usr/bin/msys-event-2-1-7.dll &&
+            "$CURL" -Lo /tmp/msgpack-c.tar.zst https://repo.msys2.org/msys/x86_64/msgpack-c-4.0.0-1-x86_64.pkg.tar.zst &&
+            tar xvf /tmp/msgpack-c.tar.zst usr/bin/msys-msgpackc-2.dll &&
+            "$CURL" -Lo /tmp/libssh.tar.zst https://repo.msys2.org/msys/x86_64/libssh-0.9.6-1-x86_64.pkg.tar.zst &&
+            tar xvf /tmp/libssh.tar.zst usr/bin/msys-ssh-4.dll
+          ) &&
+
+          # restrict SSH access to the "actor", i.e. the GitHub user who triggered this workflow
+          # this requires calling `ssh -i <private-key> [...]` later on
+          mkdir -p ~/.ssh &&
+          curl -H 'Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}' \
+            https://api.github.com/users/${{github.actor}}/keys |
+          jq -r '.[].key' >~/.ssh/authorized_keys &&
+
+          # Generate an SSH key (needed for tmate)
+          echo -e 'y\n' | ssh-keygen -q -t rsa -N '' -f ~/.ssh/id_rsa &&
+
+          # Start tmate session
+          export CHERE_INVOKING=1 &&
+          tmate -S /tmp/tmate.sock -a ~/.ssh/authorized_keys new-session -d &&
+          tmate -S /tmp/tmate.sock wait tmate-ready &&
+
+          # Print SSH invocation every 5 seconds, until tmate session has terminated
+          while test -e /tmp/tmate.sock
+          do
+            tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'
+            sleep 5
+          done
       - name: open PR
         if: steps.update.outputs.modified == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v6
         with:
           github-token: ${{ steps.setup.outputs.token }}
           script: |
@@ -173,11 +255,10 @@ jobs:
               else if (name === 'mingw-w64-pcre2') body = `See https://github.com/PCRE2Project/pcre2/blob/pcre2-${version}/ChangeLog for details.`
 
               const terms = 'type:issue repo:git-for-windows/git state:open author:app/github-actions label:component-update'
-              const [verb, q] = name === 'msys2-runtime'
-                ? ['corresponds to', `type:pr repo:git-for-windows/msys2-runtime state:open ${version}`]
-                : ['closes', `"[New ${name.replace(/^mingw-w64-/, '')} version]" (${version} OR v${version}) in:title ${terms}`]
-              const { data } = await github.rest.search.issuesAndPullRequests({ q })
-              if (data.total_count) body = `${body ? `${body}\n\n` : ''}This ${verb} ${data.items[0].html_url}`
+              const { data } = await github.rest.search.issuesAndPullRequests({
+                q: `"[New ${name.replace(/^mingw-w64-/, '')} version]" (${version} OR v${version}) in:title ${terms}`,
+              })
+              if (data.total_count) body = `${body ? `${body}\n\n` : ''}This closes ${data.items[0].html_url}`
             } catch (e) {
               console.log(e)
             }
